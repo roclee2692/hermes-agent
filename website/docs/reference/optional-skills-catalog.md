@@ -140,6 +140,7 @@ hermes skills uninstall <skill-name>
 
 | Skill | Description |
 |-------|-------------|
+| [**cross-platform-porting**](/docs/user-guide/skills/optional/migration/migration-cross-platform-porting) | Orchestrate evidence-backed cross-platform repository ports. |
 | [**openclaw-migration**](/docs/user-guide/skills/optional/migration/migration-openclaw-migration) | Import an OpenClaw setup (memories, skills) into Hermes. |
 
 ## mlops
