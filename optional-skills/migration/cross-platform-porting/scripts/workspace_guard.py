@@ -36,6 +36,11 @@ HARNESS_COMMANDS = {
     "collect-github",
     "aggregate",
 }
+PROVIDER_FAILURE_PATTERN = re.compile(
+    r"(?:\b429\b|\b5\d\d\b|resource[_ -]?exhausted|quota|rate[ _-]?limit|"
+    r"service unavailable|provider timeout|connection (?:reset|failed)|tls)",
+    re.IGNORECASE,
+)
 
 
 class GuardError(RuntimeError):
@@ -144,6 +149,14 @@ def _status_paths(repo: Path) -> list[str]:
             index += 1
         paths.append(path)
     return sorted(set(paths))
+
+
+def _ignored_paths(repo: Path) -> list[str]:
+    output = _run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        cwd=repo,
+    ).stdout
+    return sorted(path for path in output.split("\0") if path)
 
 
 def _harness_identity(executable: Path, target_repo: Path) -> dict[str, str]:
@@ -524,6 +537,7 @@ def begin_attempt(
         "number": attempts,
         "capability": capability,
         "checkpoint_revision": identity["head_revision"],
+        "ignored_paths_at_start": _ignored_paths(Path(identity["target_repo"])),
         "started_at": _utc_now(),
     }
     _write_manifest(path, manifest)
@@ -540,12 +554,19 @@ def mark_interrupted(
     identity = validate_workspace(manifest, cwd=None)
     if manifest["state"] in TERMINAL_STATES:
         raise GuardError("SESSION_TERMINAL", manifest["state"])
+    if provider_error and not PROVIDER_FAILURE_PATTERN.search(reason):
+        raise GuardError("PROVIDER_ERROR_UNVERIFIED", reason)
     if provider_error:
         manifest["provider_retries"] = int(manifest["provider_retries"]) + 1
     dirty_paths = identity["dirty_paths"]
+    attempt = manifest.get("current_attempt") or {}
+    ignored_at_start = set(attempt.get("ignored_paths_at_start", []))
+    new_ignored_paths = sorted(
+        set(_ignored_paths(Path(identity["target_repo"]))) - ignored_at_start
+    )
     if provider_error and manifest["provider_retries"] > MAX_PROVIDER_RETRIES:
         state = "PAUSED_PROVIDER"
-    elif dirty_paths:
+    elif dirty_paths or new_ignored_paths:
         state = "NEEDS_RECOVERY"
     else:
         state = "INTERRUPTED"
@@ -554,6 +575,7 @@ def mark_interrupted(
         "reason": reason,
         "provider_error": provider_error,
         "dirty_paths": dirty_paths,
+        "new_ignored_paths": new_ignored_paths,
         "state": state,
     }
     manifest["interruptions"].append(record)
@@ -587,14 +609,38 @@ def recover_checkpoint(
         )
     target = Path(manifest["target_repo"])
     before = identity["dirty_paths"]
+    ignored_at_start = set(attempt.get("ignored_paths_at_start", []))
+    new_ignored = sorted(set(_ignored_paths(target)) - ignored_at_start)
     _run(
         ["git", "restore", "--source", checkpoint, "--staged", "--worktree", "--", "."],
         cwd=target,
     )
     clean_result = _run(["git", "clean", "-fd"], cwd=target)
+    removed_ignored: list[str] = []
+    for relative in new_ignored:
+        candidate = target / relative
+        if candidate.is_symlink():
+            candidate.unlink()
+        else:
+            resolved = _canonical_existing(
+                candidate, label="attempt-created ignored file"
+            )
+            if not _is_within(resolved, target) or not resolved.is_file():
+                raise GuardError("RECOVERY_IGNORED_PATH_UNSAFE", str(candidate))
+            resolved.unlink()
+        removed_ignored.append(relative)
+        parent = candidate.parent
+        while parent != target:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
     remaining = _status_paths(target)
-    if remaining:
-        raise GuardError("RECOVERY_INCOMPLETE", ", ".join(remaining))
+    remaining_ignored = sorted(set(_ignored_paths(target)) - ignored_at_start)
+    if remaining or remaining_ignored:
+        detail = [*remaining, *(f"ignored:{item}" for item in remaining_ignored)]
+        raise GuardError("RECOVERY_INCOMPLETE", ", ".join(detail))
 
     next_state = (
         "PAUSED_PROVIDER"
@@ -605,6 +651,7 @@ def recover_checkpoint(
         "at": _utc_now(),
         "checkpoint_revision": checkpoint,
         "discarded_paths": before,
+        "discarded_ignored_paths": removed_ignored,
         "git_clean_output": clean_result.stdout.strip(),
         "state": next_state,
     }
@@ -859,6 +906,100 @@ def run_bound_harness(
     )
 
 
+def _validate_focused_command(command: Sequence[str], *, target: Path) -> list[str]:
+    if not command:
+        raise GuardError("FOCUSED_COMMAND_REQUIRED", "pass an argv after --")
+    executable = _canonical_existing(command[0], label="focused executable")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise GuardError("FOCUSED_EXECUTABLE_INVALID", str(executable))
+
+    arguments = list(command[1:])
+    name = executable.name.lower()
+    is_python = name.startswith("python") or name in {"pypy", "pypy3"}
+    if not is_python:
+        raise GuardError(
+            "FOCUSED_COMMAND_REJECTED",
+            "only an absolute Python interpreter may run focused checks",
+        )
+    if not arguments:
+        raise GuardError("FOCUSED_COMMAND_REJECTED", "interactive Python is forbidden")
+
+    if arguments[0] == "-m":
+        if len(arguments) < 2:
+            raise GuardError("FOCUSED_COMMAND_REJECTED", "missing Python module")
+        module = arguments[1]
+        allowed_modules = {"unittest", "pytest", "compileall", "py_compile"}
+        if module not in allowed_modules:
+            raise GuardError(
+                "FOCUSED_COMMAND_REJECTED",
+                f"Python module {module!r} is not a focused check",
+            )
+        return [str(executable), *arguments]
+
+    if arguments[0].startswith("-"):
+        raise GuardError(
+            "FOCUSED_COMMAND_REJECTED",
+            f"Python option {arguments[0]!r} is not a focused check",
+        )
+
+    script = Path(arguments[0])
+    if not script.is_absolute():
+        script = target / script
+    script = _canonical_existing(script, label="focused test script")
+    tests_root = target / "tests"
+    if (
+        not _is_within(script, tests_root)
+        or script.suffix != ".py"
+        or not script.name.startswith("test")
+    ):
+        raise GuardError(
+            "FOCUSED_COMMAND_REJECTED",
+            "direct Python execution is limited to test*.py beneath target/tests",
+        )
+    return [str(executable), str(script), *arguments[1:]]
+
+
+def run_focused_command(
+    manifest_path: str | Path,
+    command: Sequence[str],
+    *,
+    cwd: str | Path,
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[str]:
+    path, manifest = load_manifest(manifest_path)
+    if manifest["state"] not in MUTABLE_STATES:
+        raise GuardError("SESSION_NOT_RUNNABLE", manifest["state"])
+    if manifest.get("current_attempt") is None:
+        raise GuardError("REPAIR_ATTEMPT_REQUIRED", "call begin-attempt first")
+    identity = validate_workspace(manifest, cwd=cwd)
+    target = Path(identity["target_repo"])
+    if timeout < 1 or timeout > 300:
+        raise GuardError("FOCUSED_TIMEOUT_INVALID", str(timeout))
+    argv = _validate_focused_command(command, target=target)
+
+    audit = {
+        "argv": argv,
+        "cwd": str(target),
+        "started_at": _utc_now(),
+        "timeout_seconds": timeout,
+    }
+    try:
+        process = _run(argv, cwd=target, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        audit.update({"completed_at": _utc_now(), "status": "timed_out"})
+        manifest.setdefault("focused_commands", []).append(audit)
+        _write_manifest(path, manifest)
+        raise GuardError("FOCUSED_COMMAND_TIMEOUT", " ".join(argv)) from exc
+    audit.update({
+        "completed_at": _utc_now(),
+        "exit_code": process.returncode,
+        "status": "passed" if process.returncode == 0 else "failed",
+    })
+    manifest.setdefault("focused_commands", []).append(audit)
+    _write_manifest(path, manifest)
+    return process
+
+
 def _emit(value: Any, *, stream: Any = sys.stdout) -> None:
     json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
     stream.write("\n")
@@ -890,6 +1031,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     harness.add_argument("--manifest", required=True)
     harness.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    focused = subparsers.add_parser(
+        "run-focused", help="run a bounded Python focused check in the target"
+    )
+    focused.add_argument("--manifest", required=True)
+    focused.add_argument("--cwd", default=os.getcwd())
+    focused.add_argument("--timeout", type=int, default=180)
+    focused.add_argument("arguments", nargs=argparse.REMAINDER)
 
     begin = subparsers.add_parser("begin-attempt", help="start one capability repair")
     begin.add_argument("--manifest", required=True)
@@ -954,6 +1103,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
             )
             process = run_bound_harness(args.manifest, arguments)
+            if process.stdout:
+                sys.stdout.write(process.stdout)
+            if process.stderr:
+                sys.stderr.write(process.stderr)
+            return process.returncode
+        elif args.command == "run-focused":
+            arguments = (
+                args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+            )
+            process = run_focused_command(
+                args.manifest,
+                arguments,
+                cwd=args.cwd,
+                timeout=args.timeout,
+            )
             if process.stdout:
                 sys.stdout.write(process.stdout)
             if process.stderr:

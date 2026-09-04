@@ -1,7 +1,7 @@
 ---
 name: cross-platform-porting
 description: Orchestrate evidence-backed cross-platform repository ports.
-version: 0.1.1
+version: 0.1.2
 author: Raelon Veritas Lee (roclee2692), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -87,6 +87,7 @@ the immutable path returned by `init`. These commands bind the frozen
 | Apply LOW fixes | `python <guard> run-harness --manifest <manifest> -- fix . --safe` |
 | Generate Plan | `python <guard> run-harness --manifest <manifest> -- verify . --plan-only --output-dir <artifact-root>/plan` |
 | Local verify | `python <guard> run-harness --manifest <manifest> -- verify . --plan <artifact-root>/plan/plan.json --output-dir <artifact-root>/local-evidence` |
+| Focused Python check | `python <guard> run-focused --manifest <manifest> --cwd <target> -- <absolute-python> -m unittest <tests>` |
 | Record interruption | `python <guard> interrupt --manifest <manifest> --provider-error --reason <reason>` |
 | Recover partial attempt | `python <guard> recover --manifest <manifest> --discard-current-attempt` |
 | Final identity gate | `python <guard> finalize --manifest <manifest> --cwd <target> --plan <plan> (--summary <summary> \| --aggregate <aggregate>)` |
@@ -164,10 +165,13 @@ minimal semantic repair. Choose strategies in this fixed order:
 
 Call `begin-attempt` before reading repair context. Immediately before every
 `patch`, call `guard` with the exact absolute destination paths; a missing or
-failed guard prohibits the mutation. Preserve behavior and add or run focused
-tests for each capability. Commit a verified capability repair locally, then
-call `checkpoint` while the worktree is clean. Never turn MEDIUM coverage into
-a new generic Harness fixer.
+failed guard prohibits the mutation. One guard authorizes one immediately
+following patch; repeat it even when patching the same file again. Run Python
+focused checks only through `run-focused`, which rejects installers, arbitrary
+modules, interactive code, and application/training entrypoints. Dependency
+installation during a semantic attempt requires separate user authorization.
+Commit a verified capability repair locally, then call `checkpoint` while the
+worktree is clean. Never turn MEDIUM coverage into a new generic Harness fixer.
 
 **Done when:** one capability group is repaired, its focused tests pass, and the
 new scan evidence reflects the change.
@@ -272,6 +276,9 @@ green job or model memory is presented as proof by itself.
 - Do not call `patch` unless the immediately preceding guard authorized every
   destination path. A path mismatch is `WORKSPACE_IDENTITY_MISMATCH`, not a cue
   to guess another directory.
+- Do not use raw `terminal` to install dependencies, execute project entrypoints,
+  or improvise a test. Never run a training/data-generation script as a focused
+  check. Use `run-focused` or the bound Verification Plan.
 - Do not independently rediscover the repository after Harness emits findings;
   use location and evidence fields to load minimal context.
 - Do not modify `action_required: false` findings to make the diff look active.

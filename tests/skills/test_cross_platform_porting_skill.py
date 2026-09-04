@@ -99,7 +99,7 @@ def test_frontmatter_meets_hardline_standard() -> None:
     assert frontmatter["name"] == "cross-platform-porting"
     assert len(frontmatter["description"]) <= 60
     assert frontmatter["description"].endswith(".")
-    assert frontmatter["version"] == "0.1.1"
+    assert frontmatter["version"] == "0.1.2"
     assert not frontmatter["author"].startswith("Hermes Agent")
     assert frontmatter["platforms"] == ["linux", "macos", "windows"]
     assert frontmatter["metadata"]["hermes"]["category"] == "migration"
@@ -219,7 +219,8 @@ def bound_session(tmp_path: Path, guard_module, monkeypatch):
         "import os, sys\nprint(os.getcwd())\nprint(' '.join(sys.argv[1:]))\n",
         encoding="utf-8",
     )
-    _git(source, "add", "tracked.txt", "scan")
+    (source / ".gitignore").write_text("outputs/\n", encoding="utf-8")
+    _git(source, "add", "tracked.txt", "scan", ".gitignore")
     _git(source, "commit", "-q", "-m", "checkpoint")
 
     target = tmp_path / "repair-worktree"
@@ -365,6 +366,49 @@ def test_second_provider_failure_pauses_the_session(
     assert error.value.code == "PAUSED_PROVIDER"
 
 
+def test_non_provider_signal_cannot_consume_provider_retry(
+    bound_session, guard_module
+) -> None:
+    with pytest.raises(guard_module.GuardError) as error:
+        guard_module.mark_interrupted(
+            bound_session["manifest"],
+            reason="process terminated externally by SIGTERM",
+            provider_error=True,
+        )
+    assert error.value.code == "PROVIDER_ERROR_UNVERIFIED"
+    _, saved = guard_module.load_manifest(bound_session["manifest"])
+    assert saved["provider_retries"] == 0
+
+
+def test_recovery_removes_only_ignored_files_created_during_attempt(
+    bound_session, guard_module
+) -> None:
+    target = bound_session["target"]
+    output = target / "outputs"
+    output.mkdir()
+    preserved = output / "preexisting.bin"
+    preserved.write_bytes(b"keep")
+    guard_module.begin_attempt(
+        bound_session["manifest"], cwd=target, capability="gpu.acceleration"
+    )
+    generated = output / "generated.bin"
+    generated.write_bytes(b"discard")
+
+    interrupted = guard_module.mark_interrupted(
+        bound_session["manifest"],
+        reason="focused test process interrupted",
+        provider_error=False,
+    )
+    assert interrupted["state"] == "NEEDS_RECOVERY"
+    assert interrupted["new_ignored_paths"] == ["outputs/generated.bin"]
+    recovered = guard_module.recover_checkpoint(
+        bound_session["manifest"], discard_current_attempt=True
+    )
+    assert recovered["discarded_ignored_paths"] == ["outputs/generated.bin"]
+    assert preserved.read_bytes() == b"keep"
+    assert not generated.exists()
+
+
 def test_semantic_repair_attempts_stop_after_three(bound_session, guard_module) -> None:
     manifest = bound_session["manifest"]
     target = bound_session["target"]
@@ -377,6 +421,52 @@ def test_semantic_repair_attempts_stop_after_three(bound_session, guard_module) 
     assert error.value.code == "REPAIR_ATTEMPT_LIMIT"
     _, saved = guard_module.load_manifest(manifest)
     assert saved["state"] == "BLOCKED"
+
+
+def test_focused_runner_accepts_only_test_entrypoints(
+    bound_session, guard_module
+) -> None:
+    target = bound_session["target"]
+    guard_module.begin_attempt(
+        bound_session["manifest"], cwd=target, capability="gpu.acceleration"
+    )
+    tests = target / "tests"
+    tests.mkdir()
+    test_file = tests / "test_smoke.py"
+    test_file.write_text("print('focused-pass')\n", encoding="utf-8")
+
+    result = guard_module.run_focused_command(
+        bound_session["manifest"],
+        [sys.executable, str(test_file)],
+        cwd=target,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == "focused-pass"
+    _, saved = guard_module.load_manifest(bound_session["manifest"])
+    assert saved["focused_commands"][-1]["status"] == "passed"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [sys.executable, "-m", "pip", "install", "example"],
+        [sys.executable, "CNN_B.py"],
+        [sys.executable, "-c", "print('not bounded')"],
+    ],
+)
+def test_focused_runner_rejects_installers_and_application_code(
+    bound_session, guard_module, arguments
+) -> None:
+    target = bound_session["target"]
+    guard_module.begin_attempt(
+        bound_session["manifest"], cwd=target, capability="gpu.acceleration"
+    )
+    (target / "CNN_B.py").write_text("print('training')\n", encoding="utf-8")
+    with pytest.raises(guard_module.GuardError) as error:
+        guard_module.run_focused_command(
+            bound_session["manifest"], arguments, cwd=target
+        )
+    assert error.value.code == "FOCUSED_COMMAND_REJECTED"
 
 
 def test_final_report_requires_matching_repository_and_revision(

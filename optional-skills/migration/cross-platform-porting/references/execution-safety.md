@@ -58,6 +58,14 @@ manifest's absolute executable with the target as cwd. It accepts only the six
 frozen v0.1.0 commands, rejects another source target, and confines generated
 work/evidence paths to the manifest artifact root.
 
+Python syntax/unit checks must run through `run-focused` with an absolute
+interpreter argv. It accepts only `unittest`, `pytest`, `compileall`,
+`py_compile`, or a `test*.py` script beneath the target's `tests/` directory,
+caps execution at five minutes, and records the command in the manifest. It
+rejects package installers, arbitrary modules, interactive code, and direct
+application/training scripts. Dependency installation is a separately
+authorized operation, not an implicit reaction to a failed test.
+
 ## Resume and interruption states
 
 ```text
@@ -89,9 +97,12 @@ python <guard> recover \
 
 Recovery is available only in a dedicated linked worktree. It refuses to move a
 changed HEAD, restores tracked content from the recorded checkpoint, removes
-attempt-created untracked files, verifies a clean result, and records the
-discarded path list. After a verified repair is committed locally, call
-`checkpoint` to advance `last_known_good`.
+attempt-created untracked files, and removes only ignored files absent from the
+attempt-start snapshot. Pre-existing ignored files are preserved. It verifies a
+clean result and records both discarded path lists. A provider retry is counted
+only when the reason contains a recognizable provider failure signature; an
+ordinary process signal cannot consume that budget. After a verified repair is
+committed locally, call `checkpoint` to advance `last_known_good`.
 
 ## Final evidence gate
 
