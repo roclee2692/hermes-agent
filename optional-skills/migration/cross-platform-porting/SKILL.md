@@ -1,7 +1,7 @@
 ---
 name: cross-platform-porting
 description: Orchestrate evidence-backed cross-platform repository ports.
-version: 0.1.0
+version: 0.1.1
 author: Raelon Veritas Lee (roclee2692), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -37,6 +37,7 @@ wants a static code review with no migration work.
 - The `portability` CLI must expose `scan`, `fix`, `verify`, `render-github`,
   `collect-github`, and `aggregate`. V1 assumes the frozen v0.1.0 contract.
 - The target must be a Git repository for source-revision-bound remote evidence.
+- MEDIUM and HIGH semantic work must use a dedicated linked Git worktree.
 - Local build and test tools declared by the Verification Plan must be available.
 - Remote execution requires an authenticated `gh` CLI and a GitHub remote, but
   neither is required for scanning, safe fixes, local verification, rendering,
@@ -48,51 +49,70 @@ repairs. Never expose credentials in prompts, logs, commits, or artifacts.
 
 ## How to Run
 
-Run Harness from the target repository so relative artifact paths stay
-inspectable. Start by recording the installed version and available commands:
+Create a persistent session manifest before asking the model to inspect or
+modify source. Run the deterministic guard through `terminal`:
 
-```json
-{"command":"python -m pip show portability-harness && portability --help","workdir":"<target-repository>"}
+```text
+python <skill-directory>/scripts/workspace_guard.py init \
+  --session-id <session-id> \
+  --target-repo <dedicated-worktree> \
+  --harness-executable <absolute-portability-executable> \
+  --forbidden-write-root <harness-repository> \
+  --forbidden-write-root <original-source-repository>
 ```
 
-Replace `<target-repository>` with the resolved absolute repository path before
-calling `terminal`; never execute placeholder text literally. If the installed
-version differs from v0.1.0, verify that all six commands and the expected JSON
-fields exist before continuing. Do not emulate a missing command in the Skill.
+Resolve every placeholder to an absolute path. Retain the returned manifest
+path as the only session state. Do not use remembered cwd or search `PATH` for
+Harness. On resume, provider retry, or a new model turn, call `resume` first and
+use its `required_workdir` and `harness_executable` values.
+
+The manifest and state machine are specified in
+[references/execution-safety.md](references/execution-safety.md). Read that
+reference before any MEDIUM repair, resume, recovery, or final report.
 
 ## Quick Reference
 
-All examples are `terminal` calls with the target repository as `workdir`.
+`<guard>` is the absolute path to `scripts/workspace_guard.py`; `<manifest>` is
+the immutable path returned by `init`. These commands bind the frozen
+`portability scan`, `portability fix`, `portability verify`,
+`portability render-github`, `portability collect-github`, and
+`portability aggregate` contracts to one target.
 
 | Purpose | Command |
 |---|---|
-| Scan | `portability scan . --output-dir .portability/scan` |
-| Preview LOW fixes | `portability fix . --safe --dry-run` |
-| Apply LOW fixes | `portability fix . --safe` |
-| Generate Plan | `portability verify . --plan-only --output-dir .portability` |
-| Local verify | `portability verify . --plan .portability/plan.json --output-dir .portability/local-evidence` |
-| Render workflow | `portability render-github .portability/plan.json` |
-| Check workflow drift | `portability render-github .portability/plan.json --check` |
-| Collect GitHub evidence | `portability collect-github RUN_ID --repo OWNER/REPO --output-dir .portability/github-RUN_ID` |
-| Offline aggregate | `portability aggregate EVIDENCE_DIR --output verification-aggregate.json` |
+| Rebind after resume | `python <guard> resume --manifest <manifest>` |
+| Guard source writes | `python <guard> guard --manifest <manifest> --cwd <target> --write-path <absolute-file>` |
+| Scan | `python <guard> run-harness --manifest <manifest> -- scan . --output-dir <artifact-root>/scan` |
+| Preview LOW fixes | `python <guard> run-harness --manifest <manifest> -- fix . --safe --dry-run` |
+| Apply LOW fixes | `python <guard> run-harness --manifest <manifest> -- fix . --safe` |
+| Generate Plan | `python <guard> run-harness --manifest <manifest> -- verify . --plan-only --output-dir <artifact-root>/plan` |
+| Local verify | `python <guard> run-harness --manifest <manifest> -- verify . --plan <artifact-root>/plan/plan.json --output-dir <artifact-root>/local-evidence` |
+| Record interruption | `python <guard> interrupt --manifest <manifest> --provider-error --reason <reason>` |
+| Recover partial attempt | `python <guard> recover --manifest <manifest> --discard-current-attempt` |
+| Final identity gate | `python <guard> finalize --manifest <manifest> --cwd <target> --plan <plan> (--summary <summary> \| --aggregate <aggregate>)` |
 
 ## Procedure
 
-### 1. Preflight the repository and Harness
+### 1. Bind the repository and Harness
 
-Use `terminal` to inspect Git status, current branch, remotes, installed Harness
-version, and CLI help. Record existing dirty paths before any mutation. Never
-stash, overwrite, or commit pre-existing user changes; create a clean worktree
-when migration work would overlap them.
+Create a dedicated linked worktree for semantic repair. Initialize the Session
+Manifest with its absolute target, Git dir/common-dir identity, exact Harness
+executable, allowed source root, and explicit forbidden roots. The manifest
+must live outside all source repositories. It, not cwd, is session state.
 
-**Done when:** the repository path, base revision, dirty paths, Harness version,
-and available command surface are recorded.
+At every resume, provider retry, restored session, or new model turn, call
+`resume`. Never continue from remembered cwd. If the manifest reports
+`NEEDS_RECOVERY`, recover or stop before reading more source.
+
+**Done when:** `resume` returns the intended worktree as `required_workdir`, the
+exact Harness executable passes its version check, and the worktree is clean.
 
 ### 2. Run the initial scan
 
-Call `terminal(command="portability scan . --output-dir .portability/scan")`.
-Read the generated JSON report with `read_file`; do not independently scan or
-load the whole repository into context.
+Use the guard's `run-harness` command with `scan .` and an output directory
+under the manifest artifact root. Read the generated JSON report with
+`read_file`; do not independently scan or load the whole repository into
+context.
 
 **Done when:** every decision starts from a structured Harness finding rather
 than an agent-invented portability concern.
@@ -110,8 +130,9 @@ intentionally platform-specific. Preserve them in the report as evidence.
 
 Preview with `terminal(command="portability fix . --safe --dry-run")`. Inspect
 the touched-file set and repository-policy evidence. Apply with
-`terminal(command="portability fix . --safe")` only when the user's request
-authorizes source changes and the Git safety gate accepts the worktree.
+the guarded Harness runner only when the user's request authorizes source
+changes and the Git safety gate accepts the worktree. Before applying, call
+`guard --write-path` once for every absolute touched path.
 
 Do not force a LOW fix past repository EOL policy or use dirty mode as a blanket
 override. If an existing dirty file intersects the plan, use a clean worktree or
@@ -141,8 +162,12 @@ minimal semantic repair. Choose strategies in this fixed order:
 5. Guarded OS branch.
 6. Platform fork.
 
-Preserve behavior and add or run focused tests for each capability before moving
-to the next group. Never turn MEDIUM coverage into a new generic Harness fixer.
+Call `begin-attempt` before reading repair context. Immediately before every
+`patch`, call `guard` with the exact absolute destination paths; a missing or
+failed guard prohibits the mutation. Preserve behavior and add or run focused
+tests for each capability. Commit a verified capability repair locally, then
+call `checkpoint` while the worktree is clean. Never turn MEDIUM coverage into
+a new generic Harness fixer.
 
 **Done when:** one capability group is repaired, its focused tests pass, and the
 new scan evidence reflects the change.
@@ -159,10 +184,9 @@ proposal or an explicit blocker.
 
 ### 8. Generate and execute the local Verification Plan
 
-Generate the Plan once with `portability verify . --plan-only --output-dir
-.portability`, then execute that exact file with `portability verify . --plan
-.portability/plan.json --output-dir .portability/local-evidence`. Do not replace
-the detected project workflow with a preferred toolchain.
+Generate and execute the Plan through `run-harness`, storing Plan, work, summary,
+and logs beneath the manifest artifact root. Do not replace the detected project
+workflow with a preferred toolchain.
 
 Read `summary.json` first. Load a step log with `read_file` only when that step
 failed or was blocked.
@@ -172,9 +196,9 @@ counts, and an honest verification level.
 
 ### 9. Render, do not reinterpret, CI
 
-Call `terminal(command="portability render-github .portability/plan.json")`,
-then run the same command with `--check`. Do not hand-translate Plan argv into
-shell commands or add a parallel build/test path to the workflow.
+Guard the intended workflow path, call the bound Harness renderer, then run the
+same command with `--check`. Do not hand-translate Plan argv into shell commands
+or add a parallel build/test path to the workflow.
 
 **Done when:** renderer drift check passes and every matrix lane calls the same
 Harness verifier contract.
@@ -220,23 +244,34 @@ local verification, then request authorization before another push. Stop after
 three remote repair iterations and report the remaining blocker unless the user
 explicitly asks to continue.
 
+For a provider error, do not keep mutating or add another patch on top. Call
+`interrupt`; a dirty attempt becomes `NEEDS_RECOVERY` and must be discarded back
+to `last_known_good`. Provider retry is limited to one and semantic repair to
+three attempts. A second provider failure becomes `PAUSED_PROVIDER`.
+
 **Done when:** the failed evidence has a demonstrated root cause and a minimal
 verified repair, or the loop stops with a precise blocker.
 
 ### 14. Report the final evidence identity
 
-Report the verification level, Plan hash, source revision, platform statuses,
-mandatory counts, evidence path, and any untouched user changes. Distinguish
-synthetic tests, local evidence, job conclusions, and real aggregated remote
-evidence.
+Call `finalize` before drafting success text. For local evidence, pass Summary
+and Plan; for remote evidence, pass Aggregate and Plan. It rechecks target
+repository, current revision, Plan hash, artifact root, and evidence identity.
+Report only the returned verification level, identity, platform statuses,
+mandatory counts, evidence path, and untouched user changes.
 
-**Done when:** every success claim is traceable to an aggregate and no green job
-is presented as proof by itself.
+**Done when:** every success claim comes from the final identity gate and no
+green job or model memory is presented as proof by itself.
 
 ## Pitfalls
 
 - Do not copy Scanner, fixer, verifier, renderer, or aggregation code into this
   Skill. Missing Harness behavior is a Core issue, not an orchestration feature.
+- Do not use cwd as session state, search for Harness with `which`, or resume on
+  top of an unverified partial diff.
+- Do not call `patch` unless the immediately preceding guard authorized every
+  destination path. A path mismatch is `WORKSPACE_IDENTITY_MISMATCH`, not a cue
+  to guess another directory.
 - Do not independently rediscover the repository after Harness emits findings;
   use location and evidence fields to load minimal context.
 - Do not modify `action_required: false` findings to make the diff look active.
@@ -251,6 +286,10 @@ is presented as proof by itself.
 
 Before declaring the migration complete, confirm:
 
+- The Session Manifest still resolves to the same target, Git dir/common dir,
+  Harness executable, allowed roots, and forbidden roots.
+- Wrong cwd, forbidden-root writes, symlink escapes, and unrecovered partial
+  attempts are rejected by `workspace_guard.py`.
 - The final `source_revision` is committed and the verification checkout was clean.
 - The rendered workflow passes `--check` against the committed Plan.
 - Each required platform summary is schema-valid and has no identity issue.
