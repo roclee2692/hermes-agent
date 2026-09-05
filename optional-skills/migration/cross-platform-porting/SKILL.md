@@ -66,6 +66,13 @@ path as the only session state. Do not use remembered cwd or search `PATH` for
 Harness. On resume, provider retry, or a new model turn, call `resume` first and
 use its `required_workdir` and `harness_executable` values.
 
+Immediately after `init`, create the session runtime and launch Hermes with the
+JSON environment returned by `runtime-env` (or an equivalent explicit env
+bridge). This sets `PORTABILITY_SESSION_MANIFEST` and activates Hermes'
+bundled native execution guard. Do not run a portability repair session with
+the manifest path merely written in the prompt: the `pre_tool_call` hook must
+be active in the Hermes process.
+
 The manifest and state machine are specified in
 [references/execution-safety.md](references/execution-safety.md). Read that
 reference before any MEDIUM repair, resume, recovery, or final report.
@@ -81,6 +88,8 @@ the immutable path returned by `init`. These commands bind the frozen
 | Purpose | Command |
 |---|---|
 | Rebind after resume | `python <guard> resume --manifest <manifest>` |
+| Prepare runtime policy | `python <guard> prepare-runtime --manifest <manifest>` |
+| Print runtime environment | `python <guard> runtime-env --manifest <manifest> --lane mutation` |
 | Guard source writes | `python <guard> guard --manifest <manifest> --cwd <target> --write-path <absolute-file>` |
 | Scan | `python <guard> run-harness --manifest <manifest> -- scan . --output-dir <artifact-root>/scan` |
 | Preview LOW fixes | `python <guard> run-harness --manifest <manifest> -- fix . --safe --dry-run` |

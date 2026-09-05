@@ -32,6 +32,23 @@ The actual manifest also records attempt counts, interruptions, recovery
 receipts, and a profile-scoped artifact root. It must not live inside the target
 or any forbidden repository.
 
+The manifest is also the runtime capability policy. It records
+`source_write: true`, session-only dependency installation, and denies Git
+index/commit/push/merge/rebase operations by default. Before launching Hermes,
+prepare its session runtime:
+
+```text
+python <guard> prepare-runtime --manifest <manifest>
+python <guard> runtime-env --manifest <manifest> --lane mutation
+```
+
+Pass the returned environment to the Hermes process. It redirects Python
+user-site, bytecode, package/tool caches, and temporary files beneath the
+manifest artifact root, prepends the session virtualenv to `PATH`, sets
+`VIRTUAL_ENV`, and sets `PORTABILITY_SESSION_MANIFEST`. Hermes then
+auto-loads the bundled `portability-execution-guard` plugin and its native
+`pre_tool_call` hook. A malformed or missing active manifest fails closed.
+
 The target is a linked worktree by default. `--allow-primary-checkout` exists
 for explicitly reviewed read-only or exceptional workflows; do not use it for
 MEDIUM/HIGH source mutation.
@@ -64,7 +81,10 @@ interpreter argv. It accepts only `unittest`, `pytest`, `compileall`,
 caps execution at five minutes, and records the command in the manifest. It
 rejects package installers, arbitrary modules, interactive code, and direct
 application/training scripts. Dependency installation is a separately
-authorized operation, not an implicit reaction to a failed test.
+authorized operation, not an implicit reaction to a failed test. Inline
+interpreter snippets through `terminal` are denied; arbitrary `execute_code`
+requires an explicitly active sandbox lane. The runtime gate applies the same
+policy to `patch`, `write_file`, `skill_manage`, and `terminal` calls.
 
 ## Resume and interruption states
 

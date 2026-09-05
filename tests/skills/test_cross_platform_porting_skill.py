@@ -277,6 +277,23 @@ def test_resume_rebinds_harness_to_manifest_target(
     assert result.stdout.splitlines()[0] == str(bound_session["target"].resolve())
 
 
+def test_prepare_runtime_scopes_caches_and_manifest_bridge(bound_session, guard_module):
+    result = guard_module.prepare_runtime(bound_session["manifest"])
+    runtime = Path(result["runtime_root"])
+    assert runtime.is_dir()
+    assert runtime.is_relative_to(bound_session["state"].resolve())
+    for key in ("PYTHONPYCACHEPREFIX", "XDG_CACHE_HOME", "PIP_CACHE_DIR", "UV_CACHE_DIR", "TMPDIR"):
+        assert Path(result["environment"][key]).is_relative_to(runtime)
+    assert Path(result["environment"]["VIRTUAL_ENV"]).is_relative_to(runtime)
+    assert str(Path(result["environment"]["VIRTUAL_ENV"]) / "bin") in result["environment"]["PATH"]
+    assert result["environment"]["PORTABILITY_SESSION_MANIFEST"] == str(
+        bound_session["manifest"].resolve()
+    )
+    _, manifest = guard_module.load_manifest(bound_session["manifest"])
+    assert manifest["permissions"]["git_commit"] is False
+    assert Path(manifest["ephemeral_root"]) == runtime
+
+
 def test_forbidden_repo_and_symlink_escape_are_rejected(
     bound_session, guard_module
 ) -> None:

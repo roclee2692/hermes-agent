@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import venv
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -62,6 +63,7 @@ def _run(
     cwd: Path,
     check: bool = True,
     timeout: int = 30,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         list(command),
@@ -70,6 +72,7 @@ def _run(
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     if check and result.returncode != 0:
         message = (result.stderr or result.stdout).strip()
@@ -233,6 +236,112 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
             pass
 
 
+def _runtime_root(manifest: dict[str, Any]) -> Path:
+    """Return the session-owned runtime root, rejecting path escape."""
+    artifact = _canonical_existing(manifest["artifact_root"], label="artifact root")
+    raw = manifest.get("ephemeral_root") or (artifact / "runtime")
+    root = _canonical_candidate(raw)
+    if not _is_within(root, artifact):
+        raise GuardError("RUNTIME_ROOT_OUTSIDE_ARTIFACT", str(root))
+    return root
+
+
+def _runtime_environment(manifest: dict[str, Any], *, lane: str) -> dict[str, str]:
+    """Build a session-scoped environment without mutating the parent shell.
+
+    The returned values are deliberately ordinary strings so callers can pass
+    them directly to ``subprocess.run``.  The caller's HOME and PATH remain
+    intact; only tool caches, temporary files, and Python's user-site/pycache
+    destinations are redirected into the session runtime.
+    """
+    root = _runtime_root(manifest)
+    cache = root / "cache"
+    values = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PIP_REQUIRE_VIRTUALENV": "1",
+        "PYTHONPYCACHEPREFIX": str(root / "pycache"),
+        "XDG_CACHE_HOME": str(cache),
+        "PIP_CACHE_DIR": str(cache / "pip"),
+        "UV_CACHE_DIR": str(cache / "uv"),
+        "MPLCONFIGDIR": str(cache / "matplotlib"),
+        "HF_HOME": str(cache / "huggingface"),
+        "TORCH_HOME": str(cache / "torch"),
+        "TMPDIR": str(root / "tmp"),
+        "TEMP": str(root / "tmp"),
+        "TMP": str(root / "tmp"),
+        "PORTABILITY_SESSION_MANIFEST": str(
+            _canonical_existing(manifest["manifest_path"], label="session manifest")
+        )
+        if manifest.get("manifest_path")
+        else "",
+        "PORTABILITY_EXECUTION_LANE": lane,
+        "PORTABILITY_SANDBOX_ACTIVE": "0",
+    }
+    values = {key: value for key, value in values.items() if value != ""}
+    runtime_venv = manifest.get("runtime_virtualenv") or str(root / "python-env")
+    if isinstance(runtime_venv, str) and runtime_venv:
+        venv = _canonical_candidate(runtime_venv)
+        if not _is_within(venv, root):
+            raise GuardError("RUNTIME_VENV_OUTSIDE_RUNTIME", str(venv))
+        bin_dir = venv / ("Scripts" if os.name == "nt" else "bin")
+        if any(candidate.is_file() for candidate in (bin_dir / "python", bin_dir / "python.exe")):
+            values["VIRTUAL_ENV"] = str(venv)
+            values["PATH"] = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+    return values
+
+
+def prepare_runtime(manifest_path: str | Path) -> dict[str, Any]:
+    """Create the session runtime directories and return its environment.
+
+    This is intentionally not a dependency installer.  It only creates
+    session-owned destinations and records the policy bridge consumed by the
+    Hermes ``pre_tool_call`` guard.
+    """
+    path, manifest = load_manifest(manifest_path)
+    if manifest["state"] not in MUTABLE_STATES:
+        raise GuardError("SESSION_NOT_MUTABLE", manifest["state"])
+    root = _runtime_root(manifest)
+    directories = {
+        "root": root,
+        "cache": root / "cache",
+        "pip_cache": root / "cache" / "pip",
+        "uv_cache": root / "cache" / "uv",
+        "pycache": root / "pycache",
+        "tmp": root / "tmp",
+        "home": root / "home",
+        "matplotlib": root / "cache" / "matplotlib",
+        "huggingface": root / "cache" / "huggingface",
+        "torch": root / "cache" / "torch",
+    }
+    for directory in directories.values():
+        directory.mkdir(parents=True, exist_ok=True)
+    runtime_venv = manifest.get("runtime_virtualenv") or str(root / "python-env")
+    venv_path = _canonical_candidate(runtime_venv)
+    if not _is_within(venv_path, root):
+        raise GuardError("RUNTIME_VENV_OUTSIDE_RUNTIME", str(venv_path))
+    # This creates only a standard-library virtualenv under the session root;
+    # it never resolves or installs project dependencies.  Dependency setup
+    # remains a Verification Plan step and therefore stays auditable.
+    bin_dir = venv_path / ("Scripts" if os.name == "nt" else "bin")
+    python_candidates = [bin_dir / "python", bin_dir / "python.exe"]
+    if not any(candidate.is_file() for candidate in python_candidates):
+        venv.EnvBuilder(with_pip=True, clear=False).create(venv_path)
+    manifest["runtime_virtualenv"] = str(venv_path)
+    manifest["ephemeral_root"] = str(root)
+    manifest["manifest_path"] = str(path)
+    manifest["runtime_directories"] = {
+        name: str(directory) for name, directory in directories.items()
+    }
+    _write_manifest(path, manifest)
+    environment = _runtime_environment(manifest, lane="mutation")
+    return {
+        "runtime_root": str(root),
+        "directories": manifest["runtime_directories"],
+        "environment": environment,
+    }
+
+
 def load_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
     manifest_path = _canonical_existing(path, label="session manifest")
     try:
@@ -316,6 +425,18 @@ def create_manifest(
         "allowed_write_roots": [str(root) for root in allowed],
         "forbidden_write_roots": [str(root) for root in forbidden],
         "artifact_root": str(path.parent),
+        "ephemeral_root": str(path.parent / "runtime"),
+        "runtime_virtualenv": str(path.parent / "runtime" / "python-env"),
+        "manifest_path": str(path),
+        "permissions": {
+            "source_write": True,
+            "dependency_install": "session_only",
+            "git_index_write": False,
+            "git_commit": False,
+            "git_push": False,
+            "git_merge": False,
+            "git_rebase": False,
+        },
         "dedicated_worktree": identity["dedicated_worktree"],
         "repair_attempts": 0,
         "provider_retries": 0,
@@ -898,11 +1019,16 @@ def run_bound_harness(
     validate_workspace(manifest, cwd=None)
     validate_harness_arguments(manifest, arguments)
     target = Path(manifest["target_repo"])
+    prepare_runtime(manifest_path)
+    _, manifest = load_manifest(manifest_path)
+    environment = dict(os.environ)
+    environment.update(_runtime_environment(manifest, lane="verify"))
     return _run(
         [manifest["harness_executable"], *arguments],
         cwd=target,
         check=False,
         timeout=3600,
+        env=environment,
     )
 
 
@@ -983,8 +1109,18 @@ def run_focused_command(
         "started_at": _utc_now(),
         "timeout_seconds": timeout,
     }
+    prepare_runtime(manifest_path)
+    _, manifest = load_manifest(manifest_path)
+    environment = dict(os.environ)
+    environment.update(_runtime_environment(manifest, lane="mutation"))
     try:
-        process = _run(argv, cwd=target, check=False, timeout=timeout)
+        process = _run(
+            argv,
+            cwd=target,
+            check=False,
+            timeout=timeout,
+            env=environment,
+        )
     except subprocess.TimeoutExpired as exc:
         audit.update({"completed_at": _utc_now(), "status": "timed_out"})
         manifest.setdefault("focused_commands", []).append(audit)
@@ -1025,6 +1161,19 @@ def _parser() -> argparse.ArgumentParser:
 
     resume = subparsers.add_parser("resume", help="rebind from manifest state")
     resume.add_argument("--manifest", required=True)
+
+    runtime = subparsers.add_parser(
+        "prepare-runtime", help="create session-owned runtime/cache destinations"
+    )
+    runtime.add_argument("--manifest", required=True)
+
+    runtime_env = subparsers.add_parser(
+        "runtime-env", help="print session-scoped environment as JSON"
+    )
+    runtime_env.add_argument("--manifest", required=True)
+    runtime_env.add_argument(
+        "--lane", choices=("mutation", "verify", "sandbox"), default="mutation"
+    )
 
     harness = subparsers.add_parser(
         "run-harness", help="run the bound Harness executable in the target"
@@ -1098,6 +1247,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "resume":
             result = resume_session(args.manifest)
+        elif args.command == "prepare-runtime":
+            result = prepare_runtime(args.manifest)
+        elif args.command == "runtime-env":
+            _, manifest = load_manifest(args.manifest)
+            result = _runtime_environment(manifest, lane=args.lane)
         elif args.command == "run-harness":
             arguments = (
                 args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments

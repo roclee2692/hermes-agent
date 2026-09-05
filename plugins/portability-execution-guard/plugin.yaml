@@ -1,0 +1,6 @@
+name: portability-execution-guard
+version: "0.1.0"
+description: "Fail-closed pre_tool_call policy for portability session manifests."
+author: "Raelon Veritas Lee (roclee2692), Hermes Agent"
+hooks:
+  - pre_tool_call
