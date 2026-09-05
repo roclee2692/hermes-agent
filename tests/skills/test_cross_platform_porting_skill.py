@@ -21,6 +21,7 @@ SKILL_PATH = (
 )
 GUARD_PATH = SKILL_PATH.parent / "scripts" / "workspace_guard.py"
 SAFETY_REFERENCE = SKILL_PATH.parent / "references" / "execution-safety.md"
+CI_FAILURE_REFERENCE = SKILL_PATH.parent / "references" / "ci-failure-repair-loop.md"
 
 
 def _verification_plan(repository: Path) -> dict:
@@ -154,6 +155,25 @@ def test_skill_preserves_core_and_permission_boundaries() -> None:
     assert "NEEDS_RECOVERY" in body
     assert "PAUSED_PROVIDER" in body
     assert SAFETY_REFERENCE.is_file()
+    assert CI_FAILURE_REFERENCE.is_file()
+
+
+def test_ci_failure_loop_freezes_lane_classification_and_retry_limits() -> None:
+    content = CI_FAILURE_REFERENCE.read_text(encoding="utf-8")
+    for marker in (
+        "failed platform's `summary.json`",
+        "`code`",
+        "`dependency`",
+        "`infrastructure`",
+        "zero source changes",
+        "three remote repair iterations",
+        "one provider retry",
+        "successful-lane",
+        "Case A",
+        "Case B",
+    ):
+        assert marker in content
+    assert "do not rescan the whole" in " ".join(content.split())
 
 
 def test_skill_uses_the_frozen_cli_contract() -> None:

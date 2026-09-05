@@ -77,6 +77,11 @@ The manifest and state machine are specified in
 [references/execution-safety.md](references/execution-safety.md). Read that
 reference before any MEDIUM repair, resume, recovery, or final report.
 
+Before analyzing a remote CI failure, also read
+[references/ci-failure-repair-loop.md](references/ci-failure-repair-loop.md).
+It freezes the failed-lane context budget, root-cause classes, retry limits, and
+the no-source-change rule for infrastructure failures.
+
 ## Quick Reference
 
 `<guard>` is the absolute path to `scripts/workspace_guard.py`; `<manifest>` is
@@ -247,10 +252,16 @@ with its evidence path supplied to the user.
 
 ### 13. Repair only failed platform lanes
 
-For `PARTIALLY_VERIFIED` or `BLOCKED`, read the aggregate first. For each failed
-platform, load only its summary, non-passing step, corresponding raw log, and
-the source context implicated by that evidence. Do not reload successful lane
-logs or the whole repository.
+For `PARTIALLY_VERIFIED` or `BLOCKED`, read the aggregate first and classify the
+failed lane as `code`, `dependency`, or `infrastructure`. Load only its summary,
+non-passing step, corresponding raw log, and the source context implicated by
+that evidence. Do not reload successful lane logs or the whole repository.
+
+`code` permits a guarded minimal patch. `dependency` and `infrastructure` do
+not permit source changes: dependency setup is session-only and separately
+authorized, while infrastructure errors may only retry the allowed operation.
+Never turn a provider, registry, network, runner, or artifact error into a
+portability finding.
 
 Make the smallest patch that addresses the observed failure, repeat focused
 local verification, then request authorization before another push. Stop after
