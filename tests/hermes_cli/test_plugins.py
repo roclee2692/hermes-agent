@@ -121,6 +121,27 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    def test_portability_guard_auto_loads_for_active_session(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        manifest = PluginManifest(
+            name="portability-execution-guard",
+            key="portability-execution-guard",
+            source="bundled",
+        )
+        manager = PluginManager()
+        monkeypatch.setattr(manager, "_collect_directory_manifests", lambda: [manifest])
+        monkeypatch.setattr(manager, "_scan_entry_points", lambda: [])
+        monkeypatch.setattr(plugins_mod, "_get_disabled_plugins", lambda: {manifest.name})
+        monkeypatch.setattr(plugins_mod, "_get_enabled_plugins", lambda: None)
+        monkeypatch.setenv("PORTABILITY_SESSION_MANIFEST", "/tmp/portability-manifest.json")
+        loaded = []
+        monkeypatch.setattr(manager, "_load_plugin", loaded.append)
+
+        manager.discover_and_load()
+
+        assert loaded == [manifest]
+
     def test_removed_relay_plugin_identity_cannot_be_reloaded(
         self, monkeypatch, caplog
     ):

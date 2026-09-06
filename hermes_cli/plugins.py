@@ -104,6 +104,14 @@ class PluginToolOverrideError(PermissionError):
 
 logger = logging.getLogger(__name__)
 
+# A portability repair session carries its policy in a manifest.  The
+# execution guard is a bundled plugin, but unlike ordinary optional plugins it
+# must not be possible for an agent session to forget to enable it.  The bridge
+# is intentionally internal and inert unless the skill explicitly supplies a
+# manifest path.
+_PORTABILITY_SESSION_MANIFEST_ENV = "PORTABILITY_SESSION_MANIFEST"
+_PORTABILITY_EXECUTION_GUARD_KEY = "portability-execution-guard"
+
 
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
@@ -4044,6 +4052,21 @@ class PluginManager:
                     lookup_key,
                     loaded.error,
                 )
+                continue
+
+            # The portability skill supplies a session manifest as an
+            # explicit capability policy.  In that mode the bundled
+            # pre_tool_call guard is mandatory: an absent config entry must
+            # never silently turn a guarded repair into an unguarded one.
+            # Explicit ``plugins.disabled`` is deliberately not an escape
+            # hatch while the session bridge is active; removing the bridge
+            # is the way to leave portability-session mode.
+            if (
+                manifest.source == "bundled"
+                and lookup_key == _PORTABILITY_EXECUTION_GUARD_KEY
+                and os.environ.get(_PORTABILITY_SESSION_MANIFEST_ENV, "").strip()
+            ):
+                self._load_plugin(manifest)
                 continue
 
             # Explicit disable always wins (matches on key or on legacy

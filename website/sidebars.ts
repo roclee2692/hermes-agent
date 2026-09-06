@@ -491,6 +491,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-optional-migration',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/optional/migration/migration-cross-platform-porting',
                     'user-guide/skills/optional/migration/migration-openclaw-migration',
                   ],
                 },
